@@ -1,0 +1,11 @@
+{
+  "name": "oleg_ai",
+  "version": "1.0.6",
+  "title": "Олег — ИИ-инженер",
+  "author": "Oleg & Vlad",
+  "factorio_version": "2.0",
+  "dependencies": [
+    "base >= 2.0"
+  ],
+  "description": "Стабильный чат Олега с точной ASCII-safe передачей UTF-8 в обе стороны."
+}
