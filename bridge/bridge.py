@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Bridge: принимает JSON по UDP от Factorio, кладёт в модель, отправляет JSON-ответ обратно.
-# - слушает 127.0.0.1:38767 (от Factorio)
+# - слушит 127.0.0.1:38767 (от Factorio)
 # - отправляет ответы на 127.0.0.1:38766 (Factorio)
 # API endpoint и модель заданы требованиями.
 # API_KEY НЕ хардкодится; читается из OPENAI_API_KEY или вводится при запуске.
@@ -11,6 +11,7 @@ import sys
 import json
 import requests
 import traceback
+import time
 
 BRIDGE_BIND_IP = "127.0.0.1"
 BRIDGE_BIND_PORT = 38767
@@ -63,15 +64,30 @@ def call_model(api_key, user_text):
         ],
         "max_tokens": 800
     }
-    resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    # Try to extract standard OpenAI-like response
-    try:
-        content = data["choices"][0]["message"]["content"]
-        return content
-    except Exception:
-        return json.dumps(data, ensure_ascii=False)
+    # retry on timeout/connection errors
+    attempts = 2
+    timeout = 90
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(API_URL, headers=headers, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            # Try to extract standard OpenAI-like response
+            try:
+                content = data["choices"][0]["message"]["content"]
+                return content
+            except Exception:
+                return json.dumps(data, ensure_ascii=False)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < attempts:
+                print(f"Request attempt {attempt} failed with {e}; retrying...")
+                time.sleep(2)
+                continue
+            else:
+                raise
+        except Exception:
+            # propagate other exceptions (HTTP error etc.)
+            raise
 
 
 def main():
