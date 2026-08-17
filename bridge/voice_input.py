@@ -72,24 +72,55 @@ class Recorder:
         self.channels = channels
         self.dtype = dtype
         self._stream = None
+        # store frames as numpy 1-D float32 arrays (mono)
         self._frames = []
         self._lock = threading.Lock()
         self.recording = False
 
     def _callback(self, indata, frames, time_info, status):
+        # sounddevice RawInputStream on some platforms yields a cffi buffer / memoryview.
+        # Convert reliably to a numpy float32 1-D (mono) array copy and append.
         if status:
-            # print(status, file=sys.stderr)
+            # avoid noisy printing in callback
             pass
         with self._lock:
-            if self.recording:
-                # indata is bytes when using RawInputStream
-                self._frames.append(indata.copy())
+            if not self.recording:
+                return
+            try:
+                # If indata is a memoryview (cffi buffer), convert to bytes then to numpy
+                if isinstance(indata, memoryview):
+                    b = indata.tobytes()
+                    arr = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768.0
+                # If indata is raw bytes/bytearray (rare), same handling
+                elif isinstance(indata, (bytes, bytearray)):
+                    b = bytes(indata)
+                    arr = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768.0
+                else:
+                    # indata likely a numpy array (or something array-like) — make a copy
+                    arr = np.array(indata, copy=True)
+                    # If multi-channel, take first channel
+                    if arr.ndim > 1:
+                        arr = arr[:, 0]
+                    # Normalize int16 to float32 if necessary
+                    if arr.dtype == np.int16:
+                        arr = arr.astype(np.float32) / 32768.0
+                    elif arr.dtype != np.float32:
+                        arr = arr.astype(np.float32)
+                # Ensure 1-D float32
+                if arr.ndim > 1:
+                    arr = arr.ravel()
+                arr = arr.astype(np.float32)
+                self._frames.append(arr)
+            except Exception:
+                # ignore single-frame errors to keep stream alive
+                return
 
     def start(self):
         self._frames = []
         self.recording = True
         if self._stream is None:
             try:
+                # Use RawInputStream so on Windows we often receive bytes buffers
                 self._stream = sd.RawInputStream(samplerate=self.samplerate, blocksize=2048,
                                                 dtype=self.dtype, channels=self.channels, callback=self._callback)
                 self._stream.start()
@@ -100,24 +131,26 @@ class Recorder:
 
     def stop(self):
         self.recording = False
-        # do not stop the stream; keep it for subsequent recordings
 
     def get_wav(self):
         with self._lock:
             if not self._frames:
                 return None
-            data = b"".join(self._frames)
-            # raw int16 bytes -> numpy int16
             try:
-                audio = np.frombuffer(data, dtype=np.int16)
+                audio = np.concatenate(self._frames, axis=0)
+                return audio
             except Exception:
-                # try float32
-                audio = np.frombuffer(data, dtype=np.float32)
-                audio = (audio * 32768.0).astype(np.int16)
-            # normalize to float32 in range [-1,1]
-            audio = audio.astype(np.float32) / 32768.0
-            # ensure mono shape (-1,)
-            return audio
+                # fallback: convert any bytes-like frames
+                parts = []
+                for f in self._frames:
+                    if isinstance(f, (bytes, bytearray)):
+                        a = np.frombuffer(bytes(f), dtype=np.int16).astype(np.float32) / 32768.0
+                    else:
+                        a = np.asarray(f, dtype=np.float32)
+                    parts.append(a)
+                if not parts:
+                    return None
+                return np.concatenate(parts, axis=0)
 
 
 def transcribe_and_send(model, audio_array, samplerate, player_index, udp_ip, udp_port):
@@ -147,7 +180,6 @@ def transcribe_and_send(model, audio_array, samplerate, player_index, udp_ip, ud
 
 def check_microphone():
     try:
-        # This will raise if no default input device or unsupported settings
         sd.check_input_settings(device=None, channels=1, samplerate=16000)
         return True
     except Exception as e:
