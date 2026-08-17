@@ -57,8 +57,13 @@ except Exception:
 def send_udp_text(text, player_index, udp_ip="127.0.0.1", udp_port=38767):
     obj = {"type": "request", "player_index": player_index, "text": text, "lang": "ru"}
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.sendto(data, (udp_ip, udp_port))
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(data, (udp_ip, udp_port))
+        sock.close()
+        print(f"Sent text to bridge ({udp_ip}:{udp_port}): {text}")
+    except Exception as e:
+        print(f"Failed to send to bridge at {udp_ip}:{udp_port}: {e}")
 
 
 class Recorder:
@@ -77,16 +82,21 @@ class Recorder:
             pass
         with self._lock:
             if self.recording:
-                # indata is a numpy array (frames, channels)
+                # indata is bytes when using RawInputStream
                 self._frames.append(indata.copy())
 
     def start(self):
         self._frames = []
         self.recording = True
         if self._stream is None:
-            self._stream = sd.RawInputStream(samplerate=self.samplerate, blocksize=2048,
-                                            dtype=self.dtype, channels=self.channels, callback=self._callback)
-            self._stream.start()
+            try:
+                self._stream = sd.RawInputStream(samplerate=self.samplerate, blocksize=2048,
+                                                dtype=self.dtype, channels=self.channels, callback=self._callback)
+                self._stream.start()
+            except Exception as e:
+                print("Failed to open microphone input stream:", e)
+                print("Check that a microphone is connected and that your system allows microphone access.")
+                sys.exit(1)
 
     def stop(self):
         self.recording = False
@@ -98,7 +108,12 @@ class Recorder:
                 return None
             data = b"".join(self._frames)
             # raw int16 bytes -> numpy int16
-            audio = np.frombuffer(data, dtype=np.int16)
+            try:
+                audio = np.frombuffer(data, dtype=np.int16)
+            except Exception:
+                # try float32
+                audio = np.frombuffer(data, dtype=np.float32)
+                audio = (audio * 32768.0).astype(np.int16)
             # normalize to float32 in range [-1,1]
             audio = audio.astype(np.float32) / 32768.0
             # ensure mono shape (-1,)
@@ -112,18 +127,32 @@ def transcribe_and_send(model, audio_array, samplerate, player_index, udp_ip, ud
     try:
         sf.write(tmpname, audio_array, samplerate, subtype='PCM_16')
         # faster-whisper accepts filename
-        segments, info = model.transcribe(tmpname, language='ru')
-        text = " ".join([seg.text.strip() for seg in segments]).strip()
+        try:
+            segments, info = model.transcribe(tmpname, language='ru')
+            text = " ".join([seg.text.strip() for seg in segments]).strip()
+        except Exception as e:
+            print("Transcription error:", e)
+            text = ""
         if text:
             print(f"Transcribed: {text}")
             send_udp_text(text, player_index, udp_ip, udp_port)
         else:
-            print("No speech recognized.")
+            print("No speech recognized or transcription failed.")
     finally:
         try:
             os.remove(tmpname)
         except Exception:
             pass
+
+
+def check_microphone():
+    try:
+        # This will raise if no default input device or unsupported settings
+        sd.check_input_settings(device=None, channels=1, samplerate=16000)
+        return True
+    except Exception as e:
+        print("Microphone check failed:", e)
+        return False
 
 
 def main():
@@ -137,12 +166,21 @@ def main():
     parser.add_argument("--mode", choices=["hotkey", "manual"], default="hotkey", help="hotkey or manual enter-based mode")
     args = parser.parse_args()
 
+    # microphone check
+    if not check_microphone():
+        print("No usable microphone detected. Exiting.")
+        sys.exit(1)
+
     if not HAVE_FASTER_WHISPER:
         print("faster-whisper not installed. Install dependencies listed in bridge/requirements_voice.txt and ensure torch is installed.")
         sys.exit(1)
 
     print("Loading model (this may take a while)... model size:", args.model_size)
-    model = WhisperModel(args.model_size, device=args.device)
+    try:
+        model = WhisperModel(args.model_size, device=args.device)
+    except Exception as e:
+        print("Failed to load Whisper model:", e)
+        sys.exit(1)
 
     rec = Recorder(samplerate=16000, channels=1, dtype='int16')
 
