@@ -2,28 +2,20 @@
 """
 bridge/voice_input.py
 
-Simple local voice input for Oleg (Factorio bridge).
-Records audio from the default microphone and sends recognized text as a JSON
-UDP message to the existing bridge (127.0.0.1:38767) in the same format the
-mod expects:
-
-{ "type": "request", "player_index": <int>, "text": "<transcribed>", "lang": "ru" }
+Voice input for Oleg (Factorio bridge) with VAD, silence trimming and basic audio checks.
 
 Behavior:
 - Hotkey mode (default): press and hold the hotkey (default F9) to record; release to transcribe and send.
-- If the `keyboard` module is not available or hotkey mode disabled, an interactive manual mode is provided
-  where you press Enter to start and Enter to stop recording.
+- Manual mode (Enter) as fallback.
 
-This script uses faster-whisper for transcription by default. On CPU it may be slow
-for larger models; for best interactive performance use a small model or GPU.
+Features:
+- VAD trimming using webrtcvad to remove leading/trailing silence before transcription (optional)
+- Filter too-short or too-quiet recordings
+- Configurable energy threshold and minimum duration
+- faster-whisper transcription with tuned beam_size for speed
+- Optional assistant mode: voice_input listens for bridge replies on a local UDP port and prints them
 
-Requirements (see bridge/requirements_voice.txt). You must install torch separately
-following the official instructions for your platform if you plan to use faster-whisper.
-
-Usage examples:
-  python bridge/voice_input.py --player-index 1
-  python bridge/voice_input.py --hotkey F9 --model-size small --device cpu
-
+Output: sends JSON UDP to bridge (default 127.0.0.1:38767) in the same format the mod expects.
 """
 
 import argparse
@@ -34,19 +26,28 @@ import tempfile
 import time
 import sys
 import threading
+import math
+import datetime
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-# Try to import keyboard for global hotkey; if not available we'll fall back to manual mode
+# VAD (optional)
+try:
+    import webrtcvad
+    HAVE_VAD = True
+except Exception:
+    HAVE_VAD = False
+
+# keyboard hotkey
 try:
     import keyboard
     HAVE_KEYBOARD = True
 except Exception:
     HAVE_KEYBOARD = False
 
-# Try to import faster_whisper; if not available we will error with instructions
+# faster-whisper
 try:
     from faster_whisper import WhisperModel
     HAVE_FASTER_WHISPER = True
@@ -54,8 +55,12 @@ except Exception:
     HAVE_FASTER_WHISPER = False
 
 
-def send_udp_text(text, player_index, udp_ip="127.0.0.1", udp_port=38767):
+def send_udp_text(text, player_index, udp_ip="127.0.0.1", udp_port=38767, reply_back_ip=None, reply_back_port=None):
     obj = {"type": "request", "player_index": player_index, "text": text, "lang": "ru"}
+    # optionally request bridge to send a copy back to us (assistant mode)
+    if reply_back_ip and reply_back_port:
+        obj["reply_back_ip"] = reply_back_ip
+        obj["reply_back_port"] = int(reply_back_port)
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -78,10 +83,8 @@ class Recorder:
         self.recording = False
 
     def _callback(self, indata, frames, time_info, status):
-        # sounddevice RawInputStream on some platforms yields a cffi buffer / memoryview.
-        # Convert reliably to a numpy float32 1-D (mono) array copy and append.
+        # Convert to numpy float32 mono array and append.
         if status:
-            # avoid noisy printing in callback
             pass
         with self._lock:
             if not self.recording:
@@ -91,28 +94,22 @@ class Recorder:
                 if isinstance(indata, memoryview):
                     b = indata.tobytes()
                     arr = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768.0
-                # If indata is raw bytes/bytearray (rare), same handling
                 elif isinstance(indata, (bytes, bytearray)):
                     b = bytes(indata)
                     arr = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768.0
                 else:
-                    # indata likely a numpy array (or something array-like) — make a copy
                     arr = np.array(indata, copy=True)
-                    # If multi-channel, take first channel
                     if arr.ndim > 1:
                         arr = arr[:, 0]
-                    # Normalize int16 to float32 if necessary
                     if arr.dtype == np.int16:
                         arr = arr.astype(np.float32) / 32768.0
                     elif arr.dtype != np.float32:
                         arr = arr.astype(np.float32)
-                # Ensure 1-D float32
                 if arr.ndim > 1:
                     arr = arr.ravel()
                 arr = arr.astype(np.float32)
                 self._frames.append(arr)
             except Exception:
-                # ignore single-frame errors to keep stream alive
                 return
 
     def start(self):
@@ -120,7 +117,6 @@ class Recorder:
         self.recording = True
         if self._stream is None:
             try:
-                # Use RawInputStream so on Windows we often receive bytes buffers
                 self._stream = sd.RawInputStream(samplerate=self.samplerate, blocksize=2048,
                                                 dtype=self.dtype, channels=self.channels, callback=self._callback)
                 self._stream.start()
@@ -140,7 +136,6 @@ class Recorder:
                 audio = np.concatenate(self._frames, axis=0)
                 return audio
             except Exception:
-                # fallback: convert any bytes-like frames
                 parts = []
                 for f in self._frames:
                     if isinstance(f, (bytes, bytearray)):
@@ -153,22 +148,119 @@ class Recorder:
                 return np.concatenate(parts, axis=0)
 
 
-def transcribe_and_send(model, audio_array, samplerate, player_index, udp_ip, udp_port):
-    # Save to a temporary WAV file and ask model to transcribe it (safer compatibility)
+# VAD trimming utility (webrtcvad)
+def vad_trim(audio, sample_rate, aggressiveness=2, frame_ms=30, padding_ms=150):
+    """Trim leading and trailing silence using webrtcvad.
+    audio: float32 array [-1,1]
+    returns trimmed float32 array
+    """
+    if not HAVE_VAD:
+        return audio
+    if len(audio) == 0:
+        return audio
+    # Convert to 16-bit PCM
+    int16 = (audio * 32767).astype(np.int16)
+    pcm_bytes = int16.tobytes()
+    vad = webrtcvad.Vad(aggressiveness)
+    frame_bytes = int(sample_rate * (frame_ms / 1000.0) * 2)  # 2 bytes per sample
+    if frame_bytes <= 0:
+        return audio
+    frames = []
+    for i in range(0, len(pcm_bytes), frame_bytes):
+        frames.append(pcm_bytes[i:i+frame_bytes])
+    if not frames:
+        return audio
+    speech_flags = [vad.is_speech(f, sample_rate) if len(f) == frame_bytes else False for f in frames]
+    # find first and last True
+    try:
+        first = next(i for i, v in enumerate(speech_flags) if v)
+        last = len(speech_flags) - 1 - next(i for i, v in enumerate(reversed(speech_flags)) if v)
+    except StopIteration:
+        # no speech
+        return np.array([], dtype=np.float32)
+    # compute sample range
+    start_byte = max(0, first * frame_bytes - int(padding_ms/1000.0*sample_rate*2))
+    end_byte = min(len(pcm_bytes), (last+1) * frame_bytes + int(padding_ms/1000.0*sample_rate*2))
+    trimmed = np.frombuffer(pcm_bytes[start_byte:end_byte], dtype=np.int16).astype(np.float32) / 32768.0
+    return trimmed
+
+
+def rms_level(audio):
+    if audio is None or len(audio) == 0:
+        return 0.0
+    return math.sqrt(float(np.mean(audio.astype(np.float32) ** 2)))
+
+
+def assistant_listener(listen_ip, listen_port, stop_event):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((listen_ip, listen_port))
+    except Exception as e:
+        print(f"Assistant listener failed to bind {listen_ip}:{listen_port}: {e}")
+        return
+    sock.settimeout(1.0)
+    print(f"Assistant listening for replies on {listen_ip}:{listen_port}")
+    while not stop_event.is_set():
+        try:
+            data, addr = sock.recvfrom(65536)
+            try:
+                text = data.decode('utf-8')
+            except Exception:
+                text = data.decode('utf-8', errors='replace')
+            # try parse JSON and display text
+            try:
+                obj = json.loads(text)
+                if isinstance(obj, dict) and obj.get('type') == 'response':
+                    print(f"Assistant received response for player {obj.get('player_index')}: {obj.get('text')}")
+                else:
+                    print(f"Assistant received: {text}")
+            except Exception:
+                print(f"Assistant received raw: {text}")
+        except socket.timeout:
+            continue
+        except Exception as e:
+            print("Assistant listener error:", e)
+            break
+    sock.close()
+
+
+def transcribe_and_send(model, audio_array, samplerate, player_index, udp_ip, udp_port,
+                        min_duration=0.4, energy_threshold=0.01, vad_aggr=2, assistant=False, assistant_port=38768):
+    # 1) apply VAD trimming if available
+    trimmed = vad_trim(audio_array, samplerate, aggressiveness=vad_aggr)
+    if trimmed is None or len(trimmed) == 0:
+        print("VAD removed all audio — nothing to send.")
+        return
+    # 2) check duration
+    duration = len(trimmed) / float(samplerate)
+    if duration < min_duration:
+        print(f"Recording too short after trim: {duration:.2f}s (<{min_duration}s). Ignoring.")
+        return
+    # 3) check energy
+    level = rms_level(trimmed)
+    print(f"Post-VAD duration={duration:.2f}s rms={level:.5f}")
+    if level < energy_threshold:
+        print(f"Audio below energy threshold ({level:.5f} < {energy_threshold}). Ignoring.")
+        return
+    # 4) write temp wav and transcribe
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
         tmpname = f.name
     try:
-        sf.write(tmpname, audio_array, samplerate, subtype='PCM_16')
-        # faster-whisper accepts filename
+        sf.write(tmpname, trimmed, samplerate, subtype='PCM_16')
         try:
-            segments, info = model.transcribe(tmpname, language='ru')
+            # smaller beam_size speeds up and is usually fine for short phrases
+            segments, info = model.transcribe(tmpname, language='ru', beam_size=2)
             text = " ".join([seg.text.strip() for seg in segments]).strip()
         except Exception as e:
             print("Transcription error:", e)
             text = ""
         if text:
             print(f"Transcribed: {text}")
-            send_udp_text(text, player_index, udp_ip, udp_port)
+            if assistant:
+                # request bridge to send a copy back by including reply_back fields
+                send_udp_text(text, player_index, udp_ip, udp_port, reply_back_ip='127.0.0.1', reply_back_port=assistant_port)
+            else:
+                send_udp_text(text, player_index, udp_ip, udp_port)
         else:
             print("No speech recognized or transcription failed.")
     finally:
@@ -196,6 +288,11 @@ def main():
     parser.add_argument("--device", default="cpu", help="device for model: cpu or cuda")
     parser.add_argument("--hotkey", default="f9", help="hotkey to record (default: F9)")
     parser.add_argument("--mode", choices=["hotkey", "manual"], default="hotkey", help="hotkey or manual enter-based mode")
+    parser.add_argument("--min-duration", type=float, default=0.4, help="minimum duration after VAD to accept (s)")
+    parser.add_argument("--energy-threshold", type=float, default=0.01, help="RMS energy threshold to accept audio")
+    parser.add_argument("--vad-aggr", type=int, default=2, help="webrtcvad aggressiveness 0-3")
+    parser.add_argument("--assistant", action='store_true', help="receive bridge replies locally and print them (assistant mode)")
+    parser.add_argument("--assistant-port", type=int, default=38768, help="local UDP port to receive assistant replies")
     args = parser.parse_args()
 
     # microphone check
@@ -206,6 +303,15 @@ def main():
     if not HAVE_FASTER_WHISPER:
         print("faster-whisper not installed. Install dependencies listed in bridge/requirements_voice.txt and ensure torch is installed.")
         sys.exit(1)
+
+    if args.assistant:
+        # start assistant listener thread
+        stop_event = threading.Event()
+        t = threading.Thread(target=assistant_listener, args=('127.0.0.1', args.assistant_port, stop_event), daemon=True)
+        t.start()
+
+    if not HAVE_VAD:
+        print("webrtcvad not installed — silence trimming disabled. Install webrtcvad for better results.")
 
     print("Loading model (this may take a while)... model size:", args.model_size)
     try:
@@ -225,23 +331,23 @@ def main():
         hotkey = args.hotkey.lower()
         print(f"Hold {hotkey.upper()} to record, release to transcribe and send (player_index={args.player_index}).")
 
-        # register handlers
+        # handlers
         def on_press(e):
-            # start recording
             if not rec.recording:
                 print("Start recording...")
                 rec.start()
 
         def on_release(e):
-            # stop, get audio, transcribe
             if rec.recording:
                 rec.stop()
-                print("Stop recording, transcribing...")
+                print("Stop recording, trimming and transcribing...")
                 audio = rec.get_wav()
                 if audio is None:
                     print("No audio captured.")
                     return
-                transcribe_and_send(model, audio, rec.samplerate, args.player_index, args.udp_ip, args.udp_port)
+                transcribe_and_send(model, audio, rec.samplerate, args.player_index, args.udp_ip, args.udp_port,
+                                    min_duration=args.min_duration, energy_threshold=args.energy_threshold, vad_aggr=args.vad_aggr,
+                                    assistant=args.assistant, assistant_port=args.assistant_port)
 
         keyboard.on_press_key(hotkey, lambda e: on_press(e))
         keyboard.on_release_key(hotkey, lambda e: on_release(e))
@@ -251,6 +357,9 @@ def main():
             keyboard.wait()
         except KeyboardInterrupt:
             print("Exiting...")
+            if args.assistant:
+                stop_event.set()
+                t.join(timeout=1.0)
 
     else:
         print("Manual mode: press Enter to start recording, Enter again to stop (Ctrl+C to quit).")
@@ -261,14 +370,19 @@ def main():
                 print("Recording... press Enter to stop")
                 input()
                 rec.stop()
-                print("Stopped. Transcribing...")
+                print("Stopped. Trimming and transcribing...")
                 audio = rec.get_wav()
                 if audio is None:
                     print("No audio captured.")
                     continue
-                transcribe_and_send(model, audio, rec.samplerate, args.player_index, args.udp_ip, args.udp_port)
+                transcribe_and_send(model, audio, rec.samplerate, args.player_index, args.udp_ip, args.udp_port,
+                                    min_duration=args.min_duration, energy_threshold=args.energy_threshold, vad_aggr=args.vad_aggr,
+                                    assistant=args.assistant, assistant_port=args.assistant_port)
         except KeyboardInterrupt:
             print("Exiting...")
+            if args.assistant:
+                stop_event.set()
+                t.join(timeout=1.0)
 
 
 if __name__ == '__main__':
