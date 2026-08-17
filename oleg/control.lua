@@ -1,4 +1,5 @@
 -- Минимальный мод "Олег" для Factorio с JSON-протоколом через UDP
+-- Диагностический режим: выводит детальную информацию о входящих UDP-пакетах
 -- Использует helpers.send_udp / helpers.recv_udp и событие defines.events.on_udp_packet_received
 -- Включите UDP при запуске Factorio: --enable-lua-udp=38766
 
@@ -34,32 +35,73 @@ local function send_to_bridge(player_index, message_text)
   end
 end
 
--- Обработка входящих UDP-пакетов через событие on_udp_packet_received
+-- DEBUG: расширенный обработчик входящих UDP-пакетов
 script.on_event(defines.events.on_udp_packet_received, function(event)
-  -- Ожидаем event.data как строку JSON
-  local data = event.data or ""
-  local ok, parsed = pcall(function() return json.decode(data) end)
-  if not ok then
-    -- Некорректный JSON — просто выведем сырые данные
-    game.print("[Олег] Получен некорректный JSON: " .. tostring(data))
-    return
+  -- Соберём и выведем все ключи события (без значений, чтобы не переполнять чат)
+  local keys = {}
+  for k,_ in pairs(event) do
+    table.insert(keys, tostring(k))
+  end
+  game.print("[Олег DEBUG] event keys: " .. table.concat(keys, ", "))
+
+  -- Попробуем найти сырое содержимое в разных возможных полях
+  local raw = nil
+  if event.data then
+    raw = event.data
+  elseif event.packet and event.packet.data then
+    raw = event.packet.data
+  elseif event.message then
+    raw = event.message
+  elseif event.payload then
+    raw = event.payload
+  else
+    raw = nil
   end
 
-  if type(parsed) ~= "table" then
-    game.print("[Олег] Неправильный формат сообщения: expected table")
-    return
-  end
+  local raw_type = type(raw)
+  local raw_len = 0
+  if raw then raw_len = #tostring(raw) end
+  game.print("[Олег DEBUG] raw type=" .. raw_type .. " len=" .. tostring(raw_len))
 
-  if parsed.type == "response" and parsed.text then
-    local pidx = parsed.player_index
-    if pidx and game.get_player(pidx) then
-      game.get_player(pidx).print("[Олег] " .. tostring(parsed.text))
+  local sample = "(no data)"
+  if raw then
+    local s = tostring(raw)
+    if #s > 300 then s = s:sub(1,300) .. " ... (truncated)" end
+    sample = s
+  end
+  game.print("[Олег DEBUG] raw sample: " .. sample)
+
+  -- Попробуем декодировать JSON безопасно
+  if raw then
+    local ok, parsed = pcall(function() return json.decode(tostring(raw)) end)
+    if not ok then
+      game.print("[Олег DEBUG] JSON decode failed: " .. tostring(parsed))
+      return
+    end
+    if type(parsed) ~= "table" then
+      game.print("[Олег DEBUG] parsed JSON is not a table")
+      return
+    end
+
+    game.print("[Олег DEBUG] JSON decoded keys: " .. table.concat((function()
+      local ks = {}
+      for k,_ in pairs(parsed) do table.insert(ks, tostring(k)) end
+      return ks
+    end)(), ", "))
+
+    if parsed.type == "response" and parsed.text then
+      local pidx = parsed.player_index
+      if pidx and game.get_player(pidx) then
+        game.get_player(pidx).print("[Олег] " .. tostring(parsed.text))
+      else
+        -- если player_index отсутствует или невалиден, печатаем в global chat
+        game.print("[Олег] " .. tostring(parsed.text))
+      end
     else
-      game.print("[Олег] " .. tostring(parsed.text))
+      game.print("[Олег DEBUG] parsed has no .type==\"response\" or no .text field")
     end
   else
-    -- Другие типы или отсутствие text
-    game.print("[Олег] Получено сообщение: " .. (tostring(parsed.text) or "(нет текста)"))
+    game.print("[Олег DEBUG] no raw data field found in event")
   end
 end)
 
@@ -68,8 +110,8 @@ end)
 local TICK_POLL_INTERVAL = 5
 script.on_event(defines.events.on_tick, function(event)
   if (event.tick % TICK_POLL_INTERVAL) == 0 then
-    -- for_player = 0 чтобы принимать серверные/все пакеты; можно указать игрока
-    pcall(function() helpers.recv_udp(0) end)
+    -- Важно: вызываем helpers.recv_udp() без аргумента, чтобы обработать все пакеты
+    pcall(function() helpers.recv_udp() end)
   end
 end)
 
