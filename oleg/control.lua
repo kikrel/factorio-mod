@@ -105,6 +105,20 @@ script.on_event(defines.events.on_udp_packet_received, function(event)
   end
 end)
 
+-- Обработка обычного игрового чата (без команды) — отправляем игрокские сообщения боту
+-- Защита от зацикливания: игнорируем сообщения, начинающиеся с префикса '[Олег]'
+script.on_event(defines.events.on_console_chat, function(event)
+  -- только сообщения от игроков
+  if not event.player_index then return end
+  local msg = event.message or ""
+  -- Игнорируем сообщения, которые мод сам вывел
+  if msg:match("^%[Олег%]") then
+    return
+  end
+  -- Отправляем в bridge
+  send_to_bridge(event.player_index, msg)
+end)
+
 -- Периодически вызывать helpers.recv_udp чтобы события генерировались
 -- Вызываем каждые 5 тиков
 local TICK_POLL_INTERVAL = 5
@@ -115,7 +129,7 @@ script.on_event(defines.events.on_tick, function(event)
   end
 end)
 
--- Команда /oleg для отправки сообщений боту
+-- Команда /oleg для отправки сообщений боту (запасной вариант)
 script.on_init(function()
   commands.add_command("oleg", "Отправить сообщение боту Олег: /oleg <текст>", function(cmd)
     if not cmd.player_index then
