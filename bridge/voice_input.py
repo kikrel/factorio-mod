@@ -10,10 +10,12 @@ Behavior:
 
 Features:
 - VAD trimming using webrtcvad to remove leading/trailing silence before transcription (optional)
+- Fallback energy-based trimming when webrtcvad is not installed
 - Filter too-short or too-quiet recordings
 - Configurable energy threshold and minimum duration
 - faster-whisper transcription with tuned beam_size for speed
 - Optional assistant mode: voice_input listens for bridge replies on a local UDP port and prints them
+- Post-transcription blacklist to avoid common false positives
 
 Output: sends JSON UDP to bridge (default 127.0.0.1:38767) in the same format the mod expects.
 """
@@ -53,6 +55,13 @@ try:
     HAVE_FASTER_WHISPER = True
 except Exception:
     HAVE_FASTER_WHISPER = False
+
+
+# simple blacklist of common mis-recognitions to ignore
+BLACKLIST = [
+    "спокойная музыка",
+    "редактор субтитров",
+]
 
 
 def send_udp_text(text, player_index, udp_ip="127.0.0.1", udp_port=38767, reply_back_ip=None, reply_back_port=None):
@@ -98,16 +107,29 @@ class Recorder:
                     b = bytes(indata)
                     arr = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768.0
                 else:
+                    # indata likely numpy array-like; make a copy
                     arr = np.array(indata, copy=True)
+                    # If multi-channel, take first channel
                     if arr.ndim > 1:
                         arr = arr[:, 0]
-                    if arr.dtype == np.int16:
-                        arr = arr.astype(np.float32) / 32768.0
-                    elif arr.dtype != np.float32:
+                    # If integer type, normalize by dtype max
+                    if np.issubdtype(arr.dtype, np.integer):
+                        try:
+                            maxv = np.iinfo(arr.dtype).max
+                            arr = arr.astype(np.float32) / float(maxv if maxv > 0 else 32768.0)
+                        except Exception:
+                            arr = arr.astype(np.float32) / 32768.0
+                    else:
+                        # float types: ensure float32
                         arr = arr.astype(np.float32)
+                        # if floats appear to be in int-range, rescale
+                        max_abs = float(np.max(np.abs(arr))) if arr.size else 0.0
+                        if max_abs > 1.0:
+                            arr = arr / max_abs
+                # final ensure 1-D float32
                 if arr.ndim > 1:
                     arr = arr.ravel()
-                arr = arr.astype(np.float32)
+                arr = arr.astype(np.float32, copy=False)
                 self._frames.append(arr)
             except Exception:
                 return
@@ -148,47 +170,144 @@ class Recorder:
                 return np.concatenate(parts, axis=0)
 
 
-# VAD trimming utility (webrtcvad)
-def vad_trim(audio, sample_rate, aggressiveness=2, frame_ms=30, padding_ms=150):
-    """Trim leading and trailing silence using webrtcvad.
+# VAD trimming utility (webrtcvad) with energy fallback
+def vad_trim(audio, sample_rate, aggressiveness=2, frame_ms=30, padding_ms=150, energy_threshold=0.01):
+    """Trim leading and trailing silence using webrtcvad if available.
+    If webrtcvad is not installed, use simple energy-based trimming.
     audio: float32 array [-1,1]
     returns trimmed float32 array
     """
-    if not HAVE_VAD:
-        return audio
-    if len(audio) == 0:
-        return audio
-    # Convert to 16-bit PCM
-    int16 = (audio * 32767).astype(np.int16)
-    pcm_bytes = int16.tobytes()
-    vad = webrtcvad.Vad(aggressiveness)
-    frame_bytes = int(sample_rate * (frame_ms / 1000.0) * 2)  # 2 bytes per sample
-    if frame_bytes <= 0:
-        return audio
-    frames = []
-    for i in range(0, len(pcm_bytes), frame_bytes):
-        frames.append(pcm_bytes[i:i+frame_bytes])
-    if not frames:
-        return audio
-    speech_flags = [vad.is_speech(f, sample_rate) if len(f) == frame_bytes else False for f in frames]
-    # find first and last True
-    try:
-        first = next(i for i, v in enumerate(speech_flags) if v)
-        last = len(speech_flags) - 1 - next(i for i, v in enumerate(reversed(speech_flags)) if v)
-    except StopIteration:
-        # no speech
+    if audio is None or len(audio) == 0:
         return np.array([], dtype=np.float32)
-    # compute sample range
-    start_byte = max(0, first * frame_bytes - int(padding_ms/1000.0*sample_rate*2))
-    end_byte = min(len(pcm_bytes), (last+1) * frame_bytes + int(padding_ms/1000.0*sample_rate*2))
-    trimmed = np.frombuffer(pcm_bytes[start_byte:end_byte], dtype=np.int16).astype(np.float32) / 32768.0
-    return trimmed
+    if HAVE_VAD:
+        # Convert to 16-bit PCM
+        int16 = (audio * 32767).astype(np.int16)
+        pcm_bytes = int16.tobytes()
+        vad = webrtcvad.Vad(aggressiveness)
+        frame_bytes = int(sample_rate * (frame_ms / 1000.0) * 2)  # 2 bytes per sample
+        if frame_bytes <= 0:
+            return audio
+        frames = [pcm_bytes[i:i+frame_bytes] for i in range(0, len(pcm_bytes), frame_bytes)]
+        if not frames:
+            return np.array([], dtype=np.float32)
+        speech_flags = [vad.is_speech(f, sample_rate) if len(f) == frame_bytes else False for f in frames]
+        try:
+            first = next(i for i, v in enumerate(speech_flags) if v)
+            last = len(speech_flags) - 1 - next(i for i, v in enumerate(reversed(speech_flags)) if v)
+        except StopIteration:
+            return np.array([], dtype=np.float32)
+        start_byte = max(0, first * frame_bytes - int(padding_ms/1000.0*sample_rate*2))
+        end_byte = min(len(pcm_bytes), (last+1) * frame_bytes + int(padding_ms/1000.0*sample_rate*2))
+        trimmed = np.frombuffer(pcm_bytes[start_byte:end_byte], dtype=np.int16).astype(np.float32) / 32768.0
+        return trimmed
+    else:
+        # simple energy-based trimming (fallback)
+        frame_len = int(sample_rate * frame_ms / 1000.0)
+        if frame_len <= 0:
+            return audio
+        # pad to full frames
+        n_frames = int(math.ceil(len(audio) / frame_len))
+        energies = []
+        for i in range(n_frames):
+            start = i * frame_len
+            stop = min(len(audio), (i+1) * frame_len)
+            frame = audio[start:stop]
+            energies.append(float(np.mean(frame.astype(np.float32)**2)) if len(frame) else 0.0)
+        energies = np.array(energies)
+        speech = energies > (energy_threshold ** 2)
+        # find speech segments
+        if not np.any(speech):
+            return np.array([], dtype=np.float32)
+        first = int(np.argmax(speech))
+        last = len(speech) - 1 - int(np.argmax(speech[::-1]))
+        start_sample = max(0, first * frame_len - int(padding_ms/1000.0*sample_rate))
+        end_sample = min(len(audio), (last+1) * frame_len + int(padding_ms/1000.0*sample_rate))
+        return audio[start_sample:end_sample]
 
 
 def rms_level(audio):
     if audio is None or len(audio) == 0:
         return 0.0
     return math.sqrt(float(np.mean(audio.astype(np.float32) ** 2)))
+
+
+def is_blacklisted(text):
+    if not text:
+        return False
+    t = text.strip().lower()
+    for bad in BLACKLIST:
+        if bad in t:
+            return True
+    return False
+
+
+def transcribe_and_send(model, audio_array, samplerate, player_index, udp_ip, udp_port,
+                        min_duration=0.4, energy_threshold=0.01, vad_aggr=2, assistant=False, assistant_port=38768,
+                        min_words=1):
+    # 1) ensure audio is float32
+    if audio_array is None or len(audio_array) == 0:
+        print("No audio frames captured.")
+        return
+    audio_array = np.asarray(audio_array, dtype=np.float32)
+    # 2) apply VAD trimming (or fallback)
+    trimmed = vad_trim(audio_array, samplerate, aggressiveness=vad_aggr, energy_threshold=energy_threshold)
+    if trimmed is None or len(trimmed) == 0:
+        print("VAD removed all audio — nothing to send.")
+        return
+    # 3) check duration
+    duration = len(trimmed) / float(samplerate)
+    if duration < min_duration:
+        print(f"Recording too short after trim: {duration:.2f}s (<{min_duration}s). Ignoring.")
+        return
+    # 4) check energy
+    level = rms_level(trimmed)
+    print(f"Post-VAD duration={duration:.2f}s rms={level:.5f}")
+    if level < energy_threshold:
+        print(f"Audio below energy threshold ({level:.5f} < {energy_threshold}). Ignoring.")
+        return
+    # 5) write temp wav and transcribe
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+        tmpname = f.name
+    try:
+        sf.write(tmpname, trimmed, samplerate, subtype='PCM_16')
+        try:
+            # smaller beam_size speeds up and is usually fine for short phrases
+            segments, info = model.transcribe(tmpname, language='ru', beam_size=2)
+            text = " ".join([seg.text.strip() for seg in segments]).strip()
+        except Exception as e:
+            print("Transcription error:", e)
+            text = ""
+        if not text:
+            print("No speech recognized or transcription failed.")
+            return
+        # 6) simple post-filters
+        low_words = len([w for w in text.split() if w.strip()])
+        if low_words < min_words:
+            print(f"Transcribed too short ({low_words} words). Ignoring: {text}")
+            return
+        if is_blacklisted(text):
+            print(f"Transcribed text blacklisted, ignoring: {text}")
+            return
+        print(f"Transcribed: {text}")
+        if assistant:
+            # request bridge to send a copy back by including reply_back fields
+            send_udp_text(text, player_index, udp_ip, udp_port, reply_back_ip='127.0.0.1', reply_back_port=assistant_port)
+        else:
+            send_udp_text(text, player_index, udp_ip, udp_port)
+    finally:
+        try:
+            os.remove(tmpname)
+        except Exception:
+            pass
+
+
+def check_microphone():
+    try:
+        sd.check_input_settings(device=None, channels=1, samplerate=16000)
+        return True
+    except Exception as e:
+        print("Microphone check failed:", e)
+        return False
 
 
 def assistant_listener(listen_ip, listen_port, stop_event):
@@ -224,61 +343,6 @@ def assistant_listener(listen_ip, listen_port, stop_event):
     sock.close()
 
 
-def transcribe_and_send(model, audio_array, samplerate, player_index, udp_ip, udp_port,
-                        min_duration=0.4, energy_threshold=0.01, vad_aggr=2, assistant=False, assistant_port=38768):
-    # 1) apply VAD trimming if available
-    trimmed = vad_trim(audio_array, samplerate, aggressiveness=vad_aggr)
-    if trimmed is None or len(trimmed) == 0:
-        print("VAD removed all audio — nothing to send.")
-        return
-    # 2) check duration
-    duration = len(trimmed) / float(samplerate)
-    if duration < min_duration:
-        print(f"Recording too short after trim: {duration:.2f}s (<{min_duration}s). Ignoring.")
-        return
-    # 3) check energy
-    level = rms_level(trimmed)
-    print(f"Post-VAD duration={duration:.2f}s rms={level:.5f}")
-    if level < energy_threshold:
-        print(f"Audio below energy threshold ({level:.5f} < {energy_threshold}). Ignoring.")
-        return
-    # 4) write temp wav and transcribe
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-        tmpname = f.name
-    try:
-        sf.write(tmpname, trimmed, samplerate, subtype='PCM_16')
-        try:
-            # smaller beam_size speeds up and is usually fine for short phrases
-            segments, info = model.transcribe(tmpname, language='ru', beam_size=2)
-            text = " ".join([seg.text.strip() for seg in segments]).strip()
-        except Exception as e:
-            print("Transcription error:", e)
-            text = ""
-        if text:
-            print(f"Transcribed: {text}")
-            if assistant:
-                # request bridge to send a copy back by including reply_back fields
-                send_udp_text(text, player_index, udp_ip, udp_port, reply_back_ip='127.0.0.1', reply_back_port=assistant_port)
-            else:
-                send_udp_text(text, player_index, udp_ip, udp_port)
-        else:
-            print("No speech recognized or transcription failed.")
-    finally:
-        try:
-            os.remove(tmpname)
-        except Exception:
-            pass
-
-
-def check_microphone():
-    try:
-        sd.check_input_settings(device=None, channels=1, samplerate=16000)
-        return True
-    except Exception as e:
-        print("Microphone check failed:", e)
-        return False
-
-
 def main():
     parser = argparse.ArgumentParser(description="Voice input for Oleg (Factorio bridge)")
     parser.add_argument("--player-index", type=int, default=1, help="player_index to send in JSON (default 1)")
@@ -293,6 +357,7 @@ def main():
     parser.add_argument("--vad-aggr", type=int, default=2, help="webrtcvad aggressiveness 0-3")
     parser.add_argument("--assistant", action='store_true', help="receive bridge replies locally and print them (assistant mode)")
     parser.add_argument("--assistant-port", type=int, default=38768, help="local UDP port to receive assistant replies")
+    parser.add_argument("--min-words", type=int, default=1, help="minimum words in transcription to accept")
     args = parser.parse_args()
 
     # microphone check
@@ -311,7 +376,7 @@ def main():
         t.start()
 
     if not HAVE_VAD:
-        print("webrtcvad not installed — silence trimming disabled. Install webrtcvad for better results.")
+        print("webrtcvad not installed — using energy-based trimming fallback. Install webrtcvad for better results.")
 
     print("Loading model (this may take a while)... model size:", args.model_size)
     try:
@@ -347,7 +412,7 @@ def main():
                     return
                 transcribe_and_send(model, audio, rec.samplerate, args.player_index, args.udp_ip, args.udp_port,
                                     min_duration=args.min_duration, energy_threshold=args.energy_threshold, vad_aggr=args.vad_aggr,
-                                    assistant=args.assistant, assistant_port=args.assistant_port)
+                                    assistant=args.assistant, assistant_port=args.assistant_port, min_words=args.min_words)
 
         keyboard.on_press_key(hotkey, lambda e: on_press(e))
         keyboard.on_release_key(hotkey, lambda e: on_release(e))
@@ -377,7 +442,7 @@ def main():
                     continue
                 transcribe_and_send(model, audio, rec.samplerate, args.player_index, args.udp_ip, args.udp_port,
                                     min_duration=args.min_duration, energy_threshold=args.energy_threshold, vad_aggr=args.vad_aggr,
-                                    assistant=args.assistant, assistant_port=args.assistant_port)
+                                    assistant=args.assistant, assistant_port=args.assistant_port, min_words=args.min_words)
         except KeyboardInterrupt:
             print("Exiting...")
             if args.assistant:
